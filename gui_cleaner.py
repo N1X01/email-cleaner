@@ -1,9 +1,11 @@
 # gui_cleaner.py
-# Email Cleaner Agent – Streamlit GUI
-# Run: streamlit run gui_cleaner.py
+# Streamlit + Gmail cleaner (Cloud-safe)
+# Works locally and on Streamlit Community Cloud.
 
 import os
+import json
 import pickle
+import tempfile
 from typing import Optional, List
 
 import streamlit as st
@@ -15,23 +17,21 @@ from googleapiclient.discovery import build
 # Config
 # ==============================
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-TOKEN_FILE = "token.pickle"
 
-# Where to find Google OAuth client JSON.
-# Default: a file named 'credentials.json' in the SAME DIR as this script.
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CREDENTIALS_FILE = os.environ.get(
-    "GMAIL_CREDENTIALS_FILE",
-    os.path.join(SCRIPT_DIR, "credentials.json"),
+# Detect Streamlit Cloud runtime
+IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
+
+# Token location: /tmp on Cloud (ephemeral) | local file otherwise
+TOKEN_FILE = (
+    os.path.join(tempfile.gettempdir(), "gmail_token.pickle")
+    if IS_CLOUD
+    else "token.pickle"
 )
 
-# OpenAI (optional) — if not set, we use a cheap heuristic fallback
+# Optional OpenAI scoring (falls back to heuristic if not set)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # or gpt-3.5-turbo
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# ==============================
-# OpenAI client (best-effort)
-# ==============================
 _client = None
 _use_legacy_openai = False
 if OPENAI_API_KEY:
@@ -48,50 +48,66 @@ if OPENAI_API_KEY:
             _use_legacy_openai = False
 
 # ==============================
-# Streamlit UI Setup
+# Creds loader: Secrets -> temp file | local credentials.json
 # ==============================
-st.set_page_config(page_title="Email Cleaner Agent", layout="wide")
-st.title("📧 Email Cleaner Agent")
-st.caption("Connect to Gmail, score inbox clutter, and (optionally) auto-trash it.")
+def resolve_credentials_file() -> Optional[str]:
+    """Return a path to a valid Google OAuth client JSON."""
+    # 1) Local file next to script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    local_path = os.path.join(script_dir, "credentials.json")
+    if os.path.exists(local_path):
+        return local_path
 
-# ---- Sidebar Preflight ----
-st.sidebar.header("Preflight")
-st.sidebar.write("Working directory:", os.getcwd())
-st.sidebar.write("Script directory:", SCRIPT_DIR)
-st.sidebar.write("Credentials path:", os.path.abspath(CREDENTIALS_FILE))
+    # 2) Streamlit Secrets (google_oauth)
+    data = st.secrets.get("google_oauth", None) if hasattr(st, "secrets") else None
+    if data:
+        try:
+            parsed = json.loads(data) if isinstance(data, str) else dict(data)
+            fd, path = tempfile.mkstemp(prefix="google_creds_", suffix=".json")
+            with os.fdopen(fd, "w") as f:
+                json.dump(parsed, f)
+            return path
+        except Exception as e:
+            st.error(f"Invalid google_oauth secret: {e}")
+            return None
 
-if not os.path.exists(CREDENTIALS_FILE):
-    st.sidebar.error(
-        "Missing Google OAuth client file.\n\n"
-        f"Expected here:\n`{os.path.abspath(CREDENTIALS_FILE)}`\n\n"
-        "Fix one of these:\n"
-        "1) Put credentials.json next to gui_cleaner.py\n"
-        "2) Or export GMAIL_CREDENTIALS_FILE=/full/path/credentials.json"
-    )
-    st.stop()
+    return None
 
 # ==============================
-# Helpers
+# Gmail helpers
 # ==============================
 def get_gmail_service():
-    """Authenticate and return a Gmail API service."""
     creds = None
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "rb") as f:
             creds = pickle.load(f)
+
     if not creds or not getattr(creds, "valid", False):
         if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            # Will open a browser for consent on first run
-            creds = flow.run_local_server(port=0)
+            creds_path = resolve_credentials_file()
+            if not creds_path:
+                st.error(
+                    "Google OAuth credentials not found.\n\n"
+                    "- Local: put `credentials.json` next to `gui_cleaner.py`, or\n"
+                    "- Cloud: in **Settings → Secrets**, add key `google_oauth` with the JSON value."
+                )
+                st.stop()
+
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
+            # Cloud cannot open localhost; use console auth. Local uses browser.
+            if IS_CLOUD:
+                creds = flow.run_console()
+            else:
+                creds = flow.run_local_server(port=0)
+
         with open(TOKEN_FILE, "wb") as f:
             pickle.dump(creds, f)
+
     return build("gmail", "v1", credentials=creds)
 
 def list_messages(service, label_id: Optional[str], max_results: int) -> List[dict]:
-    """List messages with optional label (default INBOX if blank)."""
     kwargs = {"userId": "me", "maxResults": max_results}
     if label_id:
         kwargs["labelIds"] = [label_id]
@@ -105,22 +121,22 @@ def get_snippet(service, msg_id: str) -> str:
 def trash_message(service, msg_id: str):
     return service.users().messages().trash(userId="me", id=msg_id).execute()
 
+# ==============================
+# Scoring (OpenAI optional)
+# ==============================
 def cheap_fallback_score(snippet: str) -> float:
-    """Heuristic score 0..1 if no OpenAI key/client is set."""
     s = snippet.lower()
     hits = 0
-    keywords = [
-        "unsubscribe","promo","promotion","sale","deal","limited time",
-        "earnings","casino","viagra","act now","winner","congratulations",
-        "newsletter","marketing","advertisement","no-reply","noreply"
-    ]
-    for k in keywords:
+    for k in [
+        "unsubscribe","promo","promotion","sale","deal","limited time","newsletter",
+        "marketing","advertisement","no-reply","noreply","casino","viagra","winner",
+        "congratulations","act now"
+    ]:
         if k in s:
             hits += 1
     return min(1.0, 0.15 * hits)
 
 def ai_deletion_score(snippet: str) -> float:
-    """Return a float [0..1] meaning likelihood of clutter."""
     if not OPENAI_API_KEY or (_client is None and not _use_legacy_openai):
         return cheap_fallback_score(snippet)
 
@@ -153,23 +169,32 @@ def ai_deletion_score(snippet: str) -> float:
         return cheap_fallback_score(snippet)
 
 # ==============================
-# Main Controls
+# UI
 # ==============================
+st.set_page_config(page_title="Email Cleaner Agent", layout="wide")
+st.title("📧 Email Cleaner Agent")
+st.caption("Gmail cleaner that scores clutter and can auto-trash it. Cloud-safe auth.")
+
+# Sidebar preflight
+st.sidebar.header("Preflight")
+st.sidebar.write("Runtime:", "Streamlit Cloud" if IS_CLOUD else "Local")
+st.sidebar.write("Token file:", TOKEN_FILE)
+
 preview_mode = st.checkbox("Preview mode (do NOT delete)", value=True)
 max_emails = st.slider("How many emails to scan?", 1, 100, 25)
 label_to_scan = st.text_input("Gmail label ID (blank = INBOX)", value="INBOX")
-threshold = st.slider("Delete threshold (0.0–1.0)", 0.0, 1.0, 0.80, 0.01)
+threshold = st.slider("Delete threshold", 0.0, 1.0, 0.80, 0.01)
 
-col_a, col_b = st.columns([1,1], gap="large")
-with col_a:
+col1, col2 = st.columns(2)
+with col1:
     if st.button("🔄 Revoke Session (delete token)"):
-        if os.path.exists(TOKEN_FILE):
+        try:
             os.remove(TOKEN_FILE)
-            st.success("Deleted token. Re-run and re-auth will be required.")
-        else:
-            st.info("No token file found. Nothing to delete.")
+            st.success("Token removed. You will re-auth next run.")
+        except FileNotFoundError:
+            st.info("No token found.")
 
-with col_b:
+with col2:
     if st.button("🔍 Scan Inbox Now"):
         with st.spinner("Authenticating with Gmail..."):
             service = get_gmail_service()
@@ -180,12 +205,13 @@ with col_b:
             st.info("No messages found.")
         else:
             progress = st.progress(0)
-            for idx, msg in enumerate(messages, start=1):
+            total = len(messages)
+            for i, msg in enumerate(messages, start=1):
                 try:
                     snippet = get_snippet(service, msg["id"])
                 except Exception as e:
                     st.warning(f"Could not load snippet for {msg.get('id')}: {e}")
-                    progress.progress(min(1.0, idx/len(messages)))
+                    progress.progress(min(1.0, i/total))
                     continue
 
                 score = ai_deletion_score(snippet)
@@ -205,4 +231,5 @@ with col_b:
                     st.success("Keeping this email.")
 
                 st.markdown("---")
-                progress.progress(min(1.0, idx/len(messages)))
+                progress.progress(min(1.0, i/total))
+

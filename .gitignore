@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+token.json
+token.pickle
+credentials.json
+.env
+.streamlit/
